@@ -1,0 +1,4 @@
+numpy
+matplotlib
+git+https://github.com/hsaal/touchsim.git
+pytest

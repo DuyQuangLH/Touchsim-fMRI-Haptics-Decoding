@@ -1,0 +1,383 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\setmainfont{Latin Modern Roman}
+\setsansfont{Latin Modern Sans}
+\setmonofont{DejaVu Sans Mono}[Scale=0.84]
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,citecolor=blue!50!black]{hyperref}
+\usepackage{setspace}
+\setstretch{1.1}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{0pt}
+
+\lstset{language=Python, basicstyle=\ttfamily\footnotesize, keywordstyle=\color{blue!60!black},
+  commentstyle=\color{gray}, stringstyle=\color{red!50!black}, showstringspaces=false,
+  frame=single, rulecolor=\color{black!25}, backgroundcolor=\color{black!3},
+  breaklines=true, columns=fullflexible, xleftmargin=2pt, xrightmargin=2pt, aboveskip=6pt, belowskip=6pt}
+
+\renewcommand{\_}{\textunderscore\hspace{0pt}}
+\newcommand{\code}[1]{\texttt{#1}}
+\emergencystretch=3em
+\newcommand{\hs}{\ensuremath{s_h}}
+\newcommand{\sig}[1]{\par\smallskip\noindent\textbf{\texttt{#1}}\par\nopagebreak}
+
+\title{Tài liệu mã nguồn \code{hds\_touchsim}\\[2pt]\large Mẫu pin HDS $5\times3$ $\rightarrow$ kích thích TouchSim $\rightarrow$ số spike $\rightarrow$ độ tương đồng}
+\author{}
+\date{07/11/2026}
+\renewcommand{\contentsname}{Mục lục}
+
+\begin{document}
+\maketitle
+
+\noindent Tài liệu này mô tả những gì mã nguồn thực hiện: từng module, từng hàm, tham số, giá trị trả về, công thức và thuật toán bên trong, cùng cách mã được kiểm thử. Chỉ phần được lập trình được đề cập.
+
+\tableofcontents
+
+%=======================================================================
+\section{Tổng quan mã nguồn}
+\subsection{Cấu trúc tệp}
+\begin{center}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.4cm}>{\raggedright\arraybackslash}p{9.6cm}@{}}
+\toprule
+Tệp & Vai trò \\
+\midrule
+\code{hds\_touchsim/hds.py} & Thông số HDS (\code{HDSSpec}), mẫu chữ số, hình học pin, tìm vị trí đặt HDS. Chỉ dùng \code{numpy}. \\
+\code{hds\_touchsim/adapter.py} & Cầu nối với TouchSim: chuẩn hoá kích thước tay, đổi toạ độ, dựng kích thích, tạo và cân bằng quần thể afferent. \\
+\code{hds\_touchsim/evaluate.py} & Số spike, hệ số Pearson, ma trận tương đồng, tổng spike theo lớp. \\
+\code{hds\_touchsim/viz.py} & Một hàm vẽ: đường viền tay và HDS. \\
+\code{hds\_touchsim/\_\_init\_\_.py} & Xuất các tên công khai của package. \\
+\code{scripts/run\_pipeline.py} & Chạy cho 10 chữ số và lưu kết quả. \\
+\code{tests/} & \code{test\_hds.py}, \code{test\_adapter.py}, \code{fake\_touchsim.py}, \code{conftest.py}. \\
+\code{hds\_touchsim\_clean.ipynb} & Cùng mã trong một notebook. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Phụ thuộc giữa các module}
+\code{hds.py} không import module nào khác của package. \code{adapter.py} import \code{HDSSpec}, \code{bounding\_box\_px}, \code{pin\_positions\_px} từ \code{hds.py}. \code{evaluate.py} chỉ dùng \code{numpy}. \code{viz.py} import từ \code{adapter.py} và \code{hds.py}. Thư viện \code{touchsim} \emph{không} được import ở đầu \code{adapter.py}: mọi hàm nhận module \code{touchsim} qua tham số \code{ts}, và \code{load\_touchsim()} import nó khi cần. Nhờ vậy \code{hds.py}, \code{evaluate.py} và phần lớn \code{adapter.py} dùng được khi chưa cài TouchSim.
+
+\subsection{Hai hệ toạ độ trong mã}
+\begin{itemize}
+\item \textbf{pixel}: toạ độ trên ảnh bàn tay của TouchSim. Các hàm có hậu tố \code{\_px} làm việc trong hệ này.
+\item \textbf{hand}: toạ độ mm của TouchSim, là toạ độ mà \code{ts.stim\_ramp} và vị trí afferent sử dụng (\code{pins\_hand\_mm}, \code{pop.location}).
+\end{itemize}
+Chuyển đổi qua \code{ts.hand\_surface.pixel2hand} và \code{ts.hand\_surface.hand2pixel}.
+
+%=======================================================================
+\section{Module \texttt{hds.py}}
+
+\subsection{Hằng số và \texttt{HDSSpec}}
+\code{ROWS, COLS = 5, 3}. \code{HDSSpec} là \code{dataclass(frozen=True)} (bất biến) gồm các trường:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Trường & Mặc định & Ý nghĩa \\
+\midrule
+\code{pin\_diameter\_mm} & 10.0 & đường kính pin \\
+\code{pitch\_mm} & 15.0 & khoảng cách giữa hai tâm pin liền kề \\
+\code{depth\_mm} & 1.0 & độ sâu đẩy, truyền làm \code{amp} cho \code{stim\_ramp} \\
+\code{pressure\_mpa} & 0.3 & được khai báo nhưng không mã nào đọc \\
+\code{ramp\_s} & 0.2 & thời gian ramp lên và ramp xuống \\
+\code{hold\_s} & 2.6 & thời gian giữ \\
+\code{width\_mm}, \code{height\_mm} & 50.0, 80.0 & kích thước hộp bao \\
+\code{rows}, \code{cols} & 5, 3 & số hàng, số cột pin \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\sig{HDSSpec.duration\_s -> float}
+Thuộc tính, bằng $2\cdot\code{ramp\_s}+\code{hold\_s}$ (mặc định $0{,}2+2{,}6+0{,}2=3{,}0$ s).
+
+\sig{HDSSpec.pin\_offsets\_mm() -> ndarray (rows, cols, 2)}
+Trả về toạ độ tâm từng pin so với tâm HDS, đơn vị mm, trục $x$ sang phải, trục $y$ hướng lên, hàng $0$ ở trên cùng:
+\begin{equation}
+x_j=\Big(j-\tfrac{C-1}{2}\Big)p,\qquad y_i=\Big(\tfrac{R-1}{2}-i\Big)p .
+\end{equation}
+Với $R=5$, $C=3$, $p=15$: $x\in\{-15,0,15\}$, $y\in\{30,15,0,-15,-30\}$. Mã dùng \code{np.meshgrid(xs, ys)} rồi \code{np.stack([gx, gy], axis=-1)}.
+
+\subsection{Mẫu chữ số}
+\code{\_GLYPHS} là từ điển chữ số $\to$ danh sách $5$ chuỗi, mỗi chuỗi $3$ ký tự \code{0}/\code{1}. Ví dụ chữ số $3$: \code{["111","001","111","001","111"]}.
+
+\sig{digit\_tensor(d: int) -> ndarray uint8 (5, 3)}
+Đổi từng ký tự của glyph thành số nguyên; $1$ nghĩa là pin hoạt động. Số pin hoạt động của chữ số $0$--$9$ là $12,5,11,11,9,11,10,7,13,10$.
+
+\sig{hamming\_matrix() -> ndarray int (10, 10)}
+Phần tử $(a,b)$ là số ô khác nhau giữa \code{digit\_tensor(a)} và \code{digit\_tensor(b)}:
+\begin{equation}
+H_{ab}=\sum_{i,j}\mathbb 1\!\left[T_a(i,j)\neq T_b(i,j)\right].
+\end{equation}
+Ma trận đối xứng, đường chéo bằng $0$. Hai cặp có $H=1$ là $(0,8)$ và $(4,9)$; $H_{01}=13$ là lớn nhất.
+
+\subsection{Hình học}
+\sig{pin\_positions\_px(spec, center\_px, pxl\_per\_mm=1.0) -> ndarray (rows, cols, 2)}
+\begin{equation}
+\mathbf P_{ij}=\mathbf c+\rho\,\mathbf o_{ij},
+\end{equation}
+với $\mathbf c$ là \code{center\_px}, $\mathbf o_{ij}$ là \code{pin\_offsets\_mm()} và $\rho=\code{pxl\_per\_mm}$. Độ lệch $y$ được cộng trực tiếp vào toạ độ pixel, không đảo dấu.
+
+\sig{bounding\_box\_px(spec, center\_px, pxl\_per\_mm=1.0) -> (xmin, ymin, xmax, ymax)}
+Hộp $\left[c_x\mp\tfrac{W}{2}\rho,\; c_y\mp\tfrac{H}{2}\rho\right]$ với $W,H$ là \code{width\_mm}, \code{height\_mm}.
+
+\subsection{\texttt{fit\_to\_region}}
+\sig{fit\_to\_region(spec, region\_mask\_fn, search\_box, pxl\_per\_mm=1.0, step\_px=5) -> (best\_center, n\_inside, grid)}
+Tìm tâm HDS sao cho nhiều pin nhất có tâm nằm trong một vùng. Tham số:
+\begin{itemize}
+\item \code{region\_mask\_fn(x, y) -> bool}: cho biết điểm pixel $(x,y)$ có thuộc vùng không.
+\item \code{search\_box=(xmin, xmax, ymin, ymax)}: hộp chứa các tâm ứng viên (cả hai đầu mút đều được xét, vì dùng \code{np.arange(min, max+1, step\_px)}).
+\end{itemize}
+Thuật toán:
+\begin{enumerate}
+\item Với mỗi tâm ứng viên $(c_x,c_y)$ trên lưới, tính $15$ vị trí pin bằng \code{pin\_positions\_px}, đếm số pin mà \code{region\_mask\_fn} trả \code{True}, ghi vào từ điển \code{grid[(cx, cy)]}.
+\item Lấy $n^*=\max$ của \code{grid}.
+\item Lấy tập các tâm có đúng $n^*$ pin (đồng hạng), tính trọng tâm của tập này, chọn tâm trong tập có khoảng cách bình phương tới trọng tâm nhỏ nhất. Mục đích: tránh chọn tâm sát mép vùng.
+\end{enumerate}
+Giá trị trả về: tâm được chọn (tuple), $n^*$, và toàn bộ \code{grid} để xem lại. Số lần đánh giá là (số tâm trên lưới)$\times15$. Với hộp mặc định của \code{run\_pipeline.py} ($x\in[40,400]$, $y\in[100,520]$, bước $4$) lưới có $91\times106=9646$ tâm.
+
+%=======================================================================
+\section{Module \texttt{adapter.py}}
+
+\subsection{Hằng số}
+\begin{itemize}
+\item \code{PALM\_REGIONS = ["Pw1\_p","Pw2\_p","Pw3\_p","Pw4\_p","Pp1\_p","Pp2\_p"]}: tên sáu vùng lòng bàn tay trong \code{hand\_surface.tags}.
+\item \code{REAL\_HAND\_LENGTH\_MM = 189.0}: chiều dài tay đích.
+\item \code{CLASS\_RATIO = \{"SA1": 2, "RA": 4, "PC": 1\}}: tỉ lệ số afferent mục tiêu (SA1 gấp đôi PC, RA gấp đôi SA1, theo \cite{saal2017}).
+\end{itemize}
+
+\subsection{Chuẩn hoá kích thước tay}
+\sig{load\_touchsim() -> module}
+Import và trả về \code{touchsim}.
+
+\sig{ts\_px\_per\_mm(ts) -> float}
+Trả về \code{ts.hand\_surface.pxl\_per\_mm} ($\rho_{ts}\approx2{,}18$ px/mm). Mã chỉ đọc giá trị này, không ghi đè.
+
+\sig{ts\_hand\_length\_mm(ts) -> float}
+Ghép mọi đa giác trong \code{hand\_surface.boundary}, chia cho $\rho_{ts}$ và lấy \code{np.ptp} theo trục $y$:
+\begin{equation}
+L_{ts}=\max_y-\min_y \quad(\text{đơn vị mm TouchSim, } \approx209).
+\end{equation}
+
+\sig{hand\_scale(ts) -> float}
+\begin{equation}
+\hs=\frac{\code{REAL\_HAND\_LENGTH\_MM}}{L_{ts}}=\frac{189}{L_{ts}}\approx0{,}904 .
+\end{equation}
+
+\sig{px\_per\_mm(ts) -> float}
+\begin{equation}
+\rho=\frac{\rho_{ts}}{\hs}\approx2{,}41\ \text{pixel trên mỗi mm thật}.
+\end{equation}
+Đây là hệ số được dùng khi đặt HDS lên ảnh: ảnh bàn tay không đổi, còn $1$ mm thật ứng với $\rho$ pixel. Kích thước HDS luôn tính theo mm thật ($50\times80$ mm $\approx121\times193$ px), không nhân với $\hs$.
+
+\subsection{Đổi vị trí pin}
+\sig{pins\_px(ts, spec, center\_px) -> ndarray (rows, cols, 2)}
+\code{pin\_positions\_px(spec, center\_px, px\_per\_mm(ts))}.
+
+\sig{pins\_hand\_mm(ts, spec, center\_px) -> ndarray (rows, cols, 2)}
+Làm phẳng kết quả của \code{pins\_px} thành $(15,2)$, gọi \code{hand\_surface.pixel2hand}, rồi đưa về $(rows, cols, 2)$. Vì \code{pixel2hand} chia khoảng cách pixel cho $\rho_{ts}$ còn khoảng cách pixel giữa hai pin là $\rho\cdot p=\rho_{ts}p/\hs$, nên khoảng cách giữa hai pin trong hệ hand là
+\begin{equation}
+p_{ts}=\frac{p}{\hs}\approx16{,}6\ \text{mm},
+\end{equation}
+và hộp HDS là khoảng $55{,}3\times88{,}5$ mm trong đơn vị TouchSim.
+
+\subsection{\texttt{region\_mask\_fn}}
+\sig{region\_mask\_fn(ts, tags=PALM\_REGIONS, box=(0, 450, 0, 560)) -> f(x, y) -> bool}
+Tạo lưới mọi pixel nguyên trong \code{box} (\code{np.meshgrid(..., indexing="ij")}), đổi sang toạ độ hand bằng \code{pixel2hand}, gọi \code{hand\_surface.locate} để lấy chỉ số vùng của từng điểm, rồi tạo mảng boolean \code{inside} đánh dấu các điểm có chỉ số thuộc một trong các \code{tags} (tra bằng \code{hand\_surface.tags.index}). Việc này chỉ làm một lần. Hàm trả về \code{f(x, y)}: làm tròn $(x,y)$ về pixel nguyên, trả \code{False} nếu ngoài \code{box}, ngược lại trả giá trị \code{inside} tương ứng.
+
+\subsection{\texttt{build\_stimulus}}
+\sig{build\_stimulus(ts, tensor, spec, center\_px, duration\_s=None, ramp\_s=None, fs=5000) -> Stimulus}
+\begin{lstlisting}
+def build_stimulus(ts, tensor, spec: HDSSpec, center_px, duration_s=None, ramp_s=None, fs=5000):
+    duration_s = spec.duration_s if duration_s is None else duration_s
+    ramp_s = spec.ramp_s if ramp_s is None else ramp_s
+    hand = pins_hand_mm(ts, spec, center_px)
+    pin_radius_ts = spec.pin_diameter_mm / 2 / hand_scale(ts)   # real mm -> TouchSim mm
+    stim = None
+    for r in range(tensor.shape[0]):
+        for c in range(tensor.shape[1]):
+            if not tensor[r, c]:
+                continue
+            s = ts.stim_ramp(amp=spec.depth_mm, len=duration_s, loc=hand[r, c],
+                             ramp_len=ramp_s, fs=fs, pin_radius=pin_radius_ts)
+            if stim is None:
+                stim = s
+            else:
+                stim += s
+    if stim is None:
+        raise ValueError("Tensor has no active pins.")
+    return stim
+\end{lstlisting}
+Các bước:
+\begin{enumerate}
+\item \code{duration\_s} và \code{ramp\_s} lấy từ \code{spec} nếu không truyền.
+\item Vị trí pin trong hệ hand: \code{pins\_hand\_mm}.
+\item Bán kính pin đổi sang đơn vị TouchSim: $r_{ts}=\dfrac{\code{pin\_diameter\_mm}/2}{\hs}\approx5{,}53$ mm (cùng hệ số chia như vị trí pin).
+\item Với mỗi ô của \code{tensor} bằng $1$, gọi \code{ts.stim\_ramp} với \code{amp=spec.depth\_mm}, \code{len=duration\_s}, \code{loc=} tâm pin, \code{ramp\_len=ramp\_s}, \code{fs}, \code{pin\_radius=}$r_{ts}$.
+\item Cộng dồn các \code{Stimulus} bằng \code{+=}.
+\item Nếu tensor không có ô nào bằng $1$, ném \code{ValueError("Tensor has no active pins.")}.
+\end{enumerate}
+\code{depth\_mm} được truyền nguyên giá trị, không chia cho $\hs$.
+
+\subsection{\texttt{balance\_classes}}
+\sig{balance\_classes(pop, ratio=CLASS\_RATIO, seed=0) -> AfferentPopulation}
+\begin{lstlisting}
+def balance_classes(pop, ratio=CLASS_RATIO, seed=0):
+    """Randomly subsample afferents so the class counts follow `ratio` (as many as possible)."""
+    cls = np.array(pop.affclass)
+    unit = min((cls == k).sum() / w for k, w in ratio.items())
+    rng = np.random.default_rng(seed)
+    sel = np.zeros(len(cls), bool)
+    for k, w in ratio.items():
+        sel[rng.choice(np.where(cls == k)[0], int(round(unit * w)), replace=False)] = True
+    return pop[sel]
+\end{lstlisting}
+Gọi $n_k$ là số afferent của lớp $k$ và $w_k$ là trọng số trong \code{ratio}. Mã tính
+\begin{equation}
+u=\min_k\frac{n_k}{w_k},\qquad m_k=\operatorname{round}(u\,w_k),
+\end{equation}
+rồi với mỗi lớp chọn ngẫu nhiên không lặp $m_k$ chỉ số bằng \code{np.random.default\_rng(seed).choice}. Quần thể trả về là \code{pop[sel]} với \code{sel} là mặt nạ boolean, nên thứ tự afferent gốc được giữ. Cùng \code{seed} cho cùng kết quả.
+
+Ví dụ minh hoạ thuật toán: với $(n_{SA1},n_{RA},n_{PC})=(1171,2711,1036)$ và tỉ lệ $2:4:1$, $u=\min(585{,}5;\ 677{,}75;\ 1036)=585{,}5$, nên $m=(1171,\,2342,\,586)$. Lớp bị giới hạn (ở đây là SA1) được giữ nguyên. Nếu một lớp trong \code{ratio} không có afferent nào thì $u=0$ và quần thể trả về rỗng.
+
+\subsection{\texttt{make\_population}}
+\sig{make\_population(ts, spec, center\_px, margin\_mm=20.0, density\_multiplier=1.0, class\_ratio=CLASS\_RATIO, seed=0)}
+\begin{lstlisting}
+def make_population(ts, spec: HDSSpec, center_px, margin_mm=20.0, density_multiplier=1.0,
+                    class_ratio=CLASS_RATIO, seed=0):
+    """Afferents (SA1, RA, PC) under / near the HDS box (+ margin), class-balanced.
+    Build once per HDS position and reuse for every digit so responses are comparable."""
+    pop = ts.affpop_hand(density_multiplier=density_multiplier)
+    ppm = px_per_mm(ts)
+    loc_px = ts.hand_surface.hand2pixel(pop.location)
+    x0, y0, x1, y1 = bounding_box_px(spec, center_px, ppm)
+    m = margin_mm * ppm
+    keep = ((loc_px[:, 0] >= x0 - m) & (loc_px[:, 0] <= x1 + m) &
+            (loc_px[:, 1] >= y0 - m) & (loc_px[:, 1] <= y1 + m))
+    if not keep.any():
+        raise ValueError("No afferents near the HDS - is the center on the hand?")
+    pop = pop[keep]
+    return balance_classes(pop, class_ratio, seed) if class_ratio else pop
+\end{lstlisting}
+Các bước:
+\begin{enumerate}
+\item \code{ts.affpop\_hand(density\_multiplier)} tạo quần thể afferent của bàn tay.
+\item Đổi vị trí afferent sang pixel bằng \code{hand2pixel}.
+\item Tính hộp HDS bằng \code{bounding\_box\_px} với $\rho=$ \code{px\_per\_mm(ts)}, mở rộng mỗi phía \code{margin\_mm}$\cdot\rho$ pixel.
+\item Giữ afferent có vị trí pixel nằm trong hộp mở rộng (so sánh $\ge,\le$ cho cả hai trục).
+\item Nếu không còn afferent nào, ném \code{ValueError}.
+\item Nếu \code{class\_ratio} khác \code{None}, gọi \code{balance\_classes}; \code{class\_ratio=None} bỏ qua bước này.
+\end{enumerate}
+Quần thể được tạo một lần cho một vị trí HDS rồi dùng chung cho cả $10$ chữ số.
+
+\subsection{\texttt{respond}}
+\sig{respond(ts, stim, pop)}
+Trả về \code{pop.response(stim)}; kết quả có thuộc tính \code{spikes} (một mảng thời điểm spike cho mỗi afferent).
+
+%=======================================================================
+\section{Module \texttt{evaluate.py}}
+
+\sig{spike\_counts(resp) -> ndarray int (N,)}
+\code{np.array([len(s) for s in resp.spikes])}: số spike của từng afferent.
+
+\sig{evaluate(counts\_a, counts\_b) -> float}
+Hệ số Pearson giữa hai vector số spike:
+\begin{equation}
+r=\frac{\operatorname{cov}(a,b)}{\sigma_a\sigma_b}.
+\end{equation}
+Trả về \code{0.0} nếu một trong hai vector có độ lệch chuẩn bằng $0$ (tránh chia cho $0$).
+
+\sig{similarity\_matrix(all\_counts: dict) -> ndarray (n, n)}
+Sắp xếp các khoá của \code{all\_counts}, rồi $S_{ab}=\code{evaluate}(c_a,c_b)$ cho mọi cặp. Với $10$ chữ số, ma trận $10\times10$ đối xứng, đường chéo bằng $1$ (khi vector không hằng).
+
+\sig{counts\_by\_class(counts, pop) -> dict}
+Tổng số spike của các afferent thuộc mỗi lớp \code{"SA1"}, \code{"RA"}, \code{"PC"}, dạng \code{int}, dựa vào \code{pop.affclass}.
+
+%=======================================================================
+\section{Module \texttt{viz.py}}
+\sig{plot\_layout(ts, center\_px, digit=3, spec=None, highlight=PALM\_REGIONS, ax=None) -> ax}
+Vẽ trong hệ mm thật (toạ độ pixel chia cho $\rho$):
+\begin{enumerate}
+\item mỗi đa giác trong \code{hand\_surface.boundary}, tô màu nếu tên vùng thuộc \code{highlight};
+\item hộp HDS (\code{bounding\_box\_px});
+\item $15$ vòng tròn bán kính \code{pin\_diameter\_mm/2}, tô đỏ ở các pin hoạt động của \code{digit}.
+\end{enumerate}
+Giới hạn trục lấy từ đường viền tay cộng $5$ mm, tỷ lệ trục bằng nhau.
+
+%=======================================================================
+\section{Script \texttt{scripts/run\_pipeline.py}}
+\sig{run(ts, density=1.0, step\_px=4, search\_box=(40, 400, 100, 520)) -> (center, pop, all\_counts, S)}
+Thực hiện theo thứ tự:
+\begin{enumerate}
+\item In chiều dài tay TouchSim, $\rho_{ts}$, $\hs$ và $\rho$.
+\item \code{fit\_to\_region} với \code{region\_mask\_fn(ts)} và $\rho=$ \code{px\_per\_mm(ts)}; đổi kết quả thành \code{center} (tuple hai \code{float}); in số pin trong sáu vùng lòng bàn tay.
+\item \code{make\_population(ts, spec, center, density\_multiplier=density)}.
+\item Với $d=0..9$: \code{build\_stimulus} $\to$ \code{respond} $\to$ \code{spike\_counts}; in số pin, tổng spike và \code{counts\_by\_class}.
+\item \code{similarity\_matrix(all\_counts)}.
+\end{enumerate}
+\sig{main()}
+Đọc tham số dòng lệnh \code{--density} (mặc định $1.0$) và \code{--out} (mặc định \code{out/results.npz}), gọi \code{run(load\_touchsim(), ...)}, in ma trận $S$, tạo thư mục đầu ra nếu cần và lưu bằng \code{np.savez} với các khoá: \code{center}, \code{similarity}, \code{affclass}, \code{counts\_0} \ldots \code{counts\_9}.
+
+%=======================================================================
+\section{Kiểm thử}
+Chạy bằng \code{pytest}; \code{conftest.py} thêm thư mục gốc và \code{tests/} vào \code{sys.path}. Tổng cộng $13$ test.
+
+\subsection{\texttt{tests/test\_hds.py} (không cần TouchSim)}
+\begin{center}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.6cm}>{\raggedright\arraybackslash}p{9.4cm}@{}}
+\toprule
+Test & Kiểm tra \\
+\midrule
+\code{test\_digits\_shape\_and\_binary} & mỗi tensor có shape $(5,3)$, giá trị $\subseteq\{0,1\}$; chữ số $8$ có $13$ pin, chữ số $0$ có $12$ pin \\
+\code{test\_geometry\_matches\_spec} & pitch $15$ theo cả hai trục; hộp đúng $50\times80$; mép ngoài của pin xa nhất nằm trong hộp \\
+\code{test\_scale\_applies} & với $\rho=2$, pitch pixel bằng $30$ \\
+\code{test\_fit\_finds\_inside\_position} & với vùng hình chữ nhật, \code{fit\_to\_region} tìm được vị trí có $15/15$ pin trong vùng \\
+\code{test\_timing} & \code{ramp\_s}$=0{,}2$, \code{duration\_s}$=3{,}0$ \\
+\code{test\_hamming\_symmetric\_zero\_diagonal} & ma trận Hamming đối xứng, đường chéo bằng $0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{tests/test\_adapter.py}}
+\begin{center}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.6cm}>{\raggedright\arraybackslash}p{9.4cm}@{}}
+\toprule
+Test & Kiểm tra \\
+\midrule
+\code{test\_hand\_scale\_and\_ppm} & $L_{ts}=209$, $\hs=189/209$, $\rho=\rho_{ts}/\hs$ \\
+\code{test\_hds\_is\_not\_scaled\_with\_hand\_in\_pixels} & pitch trong hệ hand bằng $15/\hs$; đổi về mm thật (pixel$/\rho$) bằng đúng $15$ \\
+\code{test\_pin\_radius\_follows\_position\_scaling} & bán kính truyền cho \code{stim\_ramp} bằng $5/\hs$ \\
+\code{test\_stimulus\_has\_one\_pin\_per\_active\_cell} & với mọi chữ số, số pin trong kích thích bằng số ô $1$; tensor rỗng ném \code{ValueError} \\
+\code{test\_balance\_classes\_ratio} & sau cân bằng, $N_{SA1}\approx2N_{PC}$, $N_{RA}\approx4N_{PC}$; cùng seed cho cùng quần thể \\
+\code{test\_population\_near\_hds\_only} & mọi afferent nằm trong hộp HDS mở rộng $20$ mm \\
+\code{test\_fit\_inside\_palm\_and\_pipeline\_smoke} & \code{fit\_to\_region} với \code{region\_mask\_fn} có kết quả hợp lệ; chạy $10$ chữ số tạo ma trận $10\times10$ đối xứng, đường chéo bằng $1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{tests/fake\_touchsim.py}}
+Module thay thế \code{touchsim} tối thiểu để chạy test của \code{adapter.py} mà không cần cài TouchSim. Nó cung cấp: \code{hand\_surface} với \code{pxl\_per\_mm}$=2{,}18$, bảy hình chữ nhật (sáu vùng lòng bàn tay và một vùng ngón giữa) sao cho chiều dài đường viền là $209$ mm, \code{pixel2hand}/\code{hand2pixel} tuyến tính, \code{locate}; \code{stim\_ramp} trả về đối tượng lưu danh sách $(\text{vị trí},\text{bán kính})$ và hỗ trợ \code{+=}; \code{affpop\_hand} sinh quần thể ngẫu nhiên có seed với tỉ lệ lớp xấp xỉ $24/55/21\%$; \code{response} sinh số spike theo Poisson giảm dần theo khoảng cách tới pin gần nhất. Vì vị trí afferent và số spike là sinh giả, các test này kiểm tra logic của mã (đơn vị, chỉ số, luồng dữ liệu), không kiểm tra đầu ra của TouchSim thật.
+
+%=======================================================================
+\section{Notebook \texttt{hds\_touchsim\_clean.ipynb}}
+Notebook chứa cùng mã trong một tệp, theo thứ tự các cell: (1) cài đặt và import; (2) mã của \code{hds.py}; (3) các test của \code{test\_hds.py}, chạy ngay trong notebook; (4) mã của \code{adapter.py}; (5) mã của \code{evaluate.py} và \code{viz.py}; (6) đặt HDS (\code{fit\_to\_region}), tạo quần thể và vẽ \code{plot\_layout}; (7) mô phỏng chữ số $0$--$9$; (8) in ma trận $S$ và hệ số tương quan giữa $H$ và $S$ trên tam giác trên (\code{np.triu\_indices(10, 1)}).
+
+%=======================================================================
+\section{Ghi chú về hành vi của mã}
+\begin{itemize}
+\item \code{pressure\_mpa} chỉ là trường của \code{HDSSpec}, không hàm nào dùng.
+\item Vị trí và bán kính pin được chia cho $\hs$ khi gửi sang TouchSim; \code{depth\_mm} thì không.
+\item $L_{ts}$ (và do đó $\hs$) được định nghĩa bằng chính phép đo \code{ptp} theo $y$ của toàn bộ đường viền, nên chiều dài tay sau khi thu luôn bằng \code{REAL\_HAND\_LENGTH\_MM} theo cấu tạo.
+\item \code{region\_mask\_fn} trả \code{False} cho điểm nằm ngoài \code{box}.
+\item \code{make\_population} loại afferent ngoài hộp HDS mở rộng \code{margin\_mm}.
+\item \code{balance\_classes} trả quần thể rỗng nếu một lớp trong \code{ratio} không có afferent.
+\item \code{evaluate} trả $0$ (không phải \code{nan}) khi một vector spike không đổi.
+\end{itemize}
+
+\begin{thebibliography}{9}
+\bibitem{saal2017} H.~P. Saal, B.~P. Delhaye, B.~C. Rayhaun, S.~J. Bensmaia. \emph{Simulating tactile signals from the whole hand with millisecond precision.} PNAS, 114(28):E5693--E5702, 2017.
+\end{thebibliography}
+
+\end{document}
